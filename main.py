@@ -21,8 +21,10 @@ import datetime
 import math
 import random
 import csv
+import json
 import os
 import subprocess
+import re
 from PIL import Image, ImageTk, ImageDraw, ImageFont
 
 try:
@@ -32,20 +34,85 @@ try:
 except ImportError:
     OPENCV_AVAILABLE = False
 
+FaceEngine = None
+if OPENCV_AVAILABLE:
+    try:
+        from face_engine import FaceEngine
+    except ImportError:
+        FaceEngine = None
+
 
 # =============================================================================
-# DEFAULT ENROLLED STUDENTS DATABASE
+# PERSISTENT STUDENT ROSTER (saved to disk, next to this script / the .exe)
 # =============================================================================
-DEFAULT_STUDENTS = [
-    {"id": "STU-1001", "name": "Aarav Sharma", "dept": "Computer Science", "batch": "2024-2028", "status": "Not Marked", "time": "-", "conf": "-"},
-    {"id": "STU-1002", "name": "Priya Patel", "dept": "Computer Science", "batch": "2024-2028", "status": "Not Marked", "time": "-", "conf": "-"},
-    {"id": "STU-1003", "name": "Rohan Gupta", "dept": "Artificial Intelligence", "batch": "2024-2028", "status": "Not Marked", "time": "-", "conf": "-"},
-    {"id": "STU-1004", "name": "Ananya Iyer", "dept": "Data Science", "batch": "2024-2028", "status": "Not Marked", "time": "-", "conf": "-"},
-    {"id": "STU-1005", "name": "Vikram Singh", "dept": "Computer Science", "batch": "2024-2028", "status": "Not Marked", "time": "-", "conf": "-"},
-    {"id": "STU-1006", "name": "Sneha Reddy", "dept": "Electronics & Comm.", "batch": "2024-2028", "status": "Not Marked", "time": "-", "conf": "-"},
-    {"id": "STU-1007", "name": "Kavya Nair", "dept": "Computer Science", "batch": "2024-2028", "status": "Not Marked", "time": "-", "conf": "-"},
-    {"id": "STU-1008", "name": "Rahul Verma", "dept": "Information Tech.", "batch": "2024-2028", "status": "Not Marked", "time": "-", "conf": "-"},
-]
+STUDENTS_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "students_db.json")
+SETTINGS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "app_settings.json")
+
+
+def load_students_db():
+    """Load the enrolled-student roster from disk. Only identity fields
+    (id/name/dept/batch) are persisted -- attendance status always resets
+    to 'Not Marked' at the start of a new session."""
+    if not os.path.isfile(STUDENTS_DB_PATH):
+        return []
+    try:
+        with open(STUDENTS_DB_PATH, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return []
+
+    students = []
+    for s in raw:
+        if not isinstance(s, dict) or "id" not in s or "name" not in s:
+            continue
+        students.append({
+            "id": s["id"],
+            "name": s["name"],
+            "dept": s.get("dept", "Computer Science"),
+            "batch": s.get("batch", "2026-2030"),
+            "status": "Not Marked",
+            "time": "-",
+            "conf": "-",
+        })
+    return students
+
+
+def save_students_db(students):
+    """Persist only identity fields for each student -- never the
+    per-session status/time/confidence, which are meant to reset."""
+    try:
+        payload = [
+            {"id": s["id"], "name": s["name"], "dept": s["dept"], "batch": s["batch"]}
+            for s in students
+        ]
+        with open(STUDENTS_DB_PATH, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+        return True
+    except OSError:
+        return False
+
+
+def load_confidence_threshold():
+    """Load the last recognition threshold, falling back to 60 percent."""
+    try:
+        with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
+            settings = json.load(f)
+            # Accept the old key so existing installations keep their saved threshold.
+            value = settings.get("match_score_threshold", settings.get("confidence_threshold", 60))
+        value = int(value)
+        return value if 50 <= value <= 95 else 60
+    except (OSError, json.JSONDecodeError, AttributeError, TypeError, ValueError):
+        return 60
+
+
+def save_confidence_threshold(value):
+    """Persist the recognition threshold used by the slider."""
+    try:
+        with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
+            json.dump({"match_score_threshold": int(value)}, f, indent=2)
+        return True
+    except OSError:
+        return False
 
 
 # =============================================================================
@@ -150,15 +217,36 @@ class AttendanceApp:
         self.root.title("FaceTrack AI - Real-Time Smart Attendance System")
         self.root.geometry("1280x840")
         self.root.minsize(1100, 720)
-        self.root.configure(bg="#0F172A")
+        self.root.configure(bg="#07111d")
+        self.root.option_add("*Font", "Arial 9")
+
+        self.palette = {
+            "bg": "#07111d",
+            "bg_alt": "#0b1728",
+            "panel": "#101d2d",
+            "panel_2": "#14273c",
+            "card": "#122235",
+            "card_2": "#0d1b2d",
+            "line": "#233548",
+            "text": "#e5eefb",
+            "muted": "#9bb0c9",
+            "primary": "#4cc9f0",
+            "primary_2": "#3b82f6",
+            "success": "#34d399",
+            "warning": "#fbbf24",
+            "danger": "#f87171",
+            "violet": "#8b5cf6",
+        }
 
         # State Variables
         self.is_feed_paused = False
         self.camera_thread = None
         self.uploaded_image = None
         self.current_source = "Camera 0 (Default Webcam)"
-        self.confidence_threshold = 75
-        self.students = [dict(s) for s in DEFAULT_STUDENTS]
+        self.room_name = "Tech Lab 3"
+        self.lecturer_name = "Dr. Sharma"
+        self.confidence_threshold = load_confidence_threshold()
+        self.students = load_students_db()
         self.attendance_log = []
         self.detected_face_info = None
         self.anim_tick = 0
@@ -167,8 +255,27 @@ class AttendanceApp:
         self.last_fps_time = time.time()
         self.black_frame_warning_shown = False
 
-        self.recent_banner_text = "System Ready. Camera active and scanning."
+        self.recent_banner_text = "System Ready. Enroll a student's face in 'Enroll New', then use 'Recognize Face Now' to test recognition."
         self.recent_banner_type = "info"
+
+        # Face detection / recognition engine state (real, not simulated)
+        self.face_engine = None
+        self.recognition_enabled = False
+        self.last_face_rect = None          # (x, y, w, h) in source-frame pixel coords
+        self.last_face_gray = None          # cropped grayscale face, ready for recognizer.predict
+        self.last_face_source_size = (0, 0)  # (w, h) of the frame the detection ran on
+        self.last_face_seen_time = 0.0
+
+        if OPENCV_AVAILABLE and FaceEngine is not None:
+            try:
+                self.face_engine = FaceEngine()
+                self.recognition_enabled = self.face_engine.has_recognizer_backend
+                self.face_engine.train()  # silently load any previously-enrolled faces from disk
+            except Exception as e:
+                self.face_engine = None
+                self.recognition_enabled = False
+                self.recent_banner_text = f"Face engine failed to load: {e}"
+                self.recent_banner_type = "warning"
 
         # Theme & Styles
         self._setup_theme_and_styles()
@@ -190,85 +297,187 @@ class AttendanceApp:
 
     def _setup_theme_and_styles(self):
         style = ttk.Style()
-        style.theme_use("clam")
+        try:
+            style.theme_use("clam")
+        except Exception:
+            pass
 
         style.configure("Treeview",
-                        background="#1E293B",
-                        foreground="#F8FAFC",
-                        fieldbackground="#1E293B",
+                        background=self.palette["card"],
+                        foreground=self.palette["text"],
+                        fieldbackground=self.palette["card"],
                         rowheight=32,
-                        font=("Segoe UI", 10))
+                        font=("Arial", 10))
         style.configure("Treeview.Heading",
-                        background="#334155",
-                        foreground="#38BDF8",
-                        font=("Segoe UI", 10, "bold"),
-                        padding=6)
+                        background="#1a2d43",
+                        foreground=self.palette["primary"],
+                        font=("Arial", 10, "bold"),
+                        padding=8)
         style.map("Treeview",
-                  background=[("selected", "#2563EB")],
+                  background=[("selected", self.palette["primary_2"])],
                   foreground=[("selected", "#FFFFFF")])
 
-        style.configure("TNotebook", background="#0F172A", borderwidth=0)
+        style.configure("TNotebook", background=self.palette["bg"], borderwidth=0)
         style.configure("TNotebook.Tab",
-                        background="#1E293B",
-                        foreground="#94A3B8",
-                        font=("Segoe UI", 10, "bold"),
-                        padding=[16, 8])
+                        background="#13273d",
+                        foreground="#b5c7db",
+                        font=("Arial", 10, "bold"),
+                        padding=[18, 10])
         style.map("TNotebook.Tab",
-                  background=[("selected", "#38BDF8")],
-                  foreground=[("selected", "#0F172A")])
+                  background=[("selected", self.palette["primary"]), ("active", "#1a3559")],
+                  foreground=[("selected", "#03131d"), ("active", self.palette["text"])])
 
         style.configure("Vertical.TScrollbar",
-                        background="#334155",
-                        troughcolor="#1E293B",
-                        arrowcolor="#94A3B8")
+                        background="#324968",
+                        troughcolor="#0d1c2c",
+                        arrowcolor="#cfe2ff")
+
+        style.configure("Modern.TCombobox",
+                        fieldbackground="#0d1f2f",
+                        background="#162b3e",
+                        foreground="#e5eefb",
+                        arrowcolor="#8bd3ff",
+                        selectbackground="#1a3559",
+                        selectforeground="#ffffff",
+                        padding=6)
+        style.map("Modern.TCombobox",
+                  fieldbackground=[("readonly", "#0d1f2f")],
+                  background=[("readonly", "#162b3e")],
+                  foreground=[("readonly", "#e5eefb")])
+
+    def _build_action_button(self, parent, text, command=None, bg="#1b3050", fg="#e5eefb",
+                            active_bg="#233f66", font=("Arial", 9, "bold"), padx=12, pady=6,
+                            side=tk.LEFT, anchor=None, width=None):
+        btn = tk.Button(
+            parent,
+            text=text,
+            command=command,
+            bg=bg,
+            fg=fg,
+            activebackground=active_bg,
+            activeforeground="#ffffff",
+            relief=tk.FLAT,
+            borderwidth=0,
+            highlightthickness=0,
+            padx=padx,
+            pady=pady,
+            font=font,
+            cursor="hand2",
+            width=width,
+        )
+        btn.bind("<Enter>", lambda e: btn.configure(bg=active_bg))
+        btn.bind("<Leave>", lambda e: btn.configure(bg=bg))
+        if side is not None:
+            btn.pack(side=side, padx=(0, 8) if side == tk.LEFT else (0, 0))
+        if anchor is not None:
+            btn.pack(anchor=anchor)
+        return btn
 
     # =========================================================================
     # UI BUILDERS
     # =========================================================================
     def _build_header(self):
-        header_frame = tk.Frame(self.root, bg="#1E293B", height=70, padx=20, pady=10)
+        header_frame = tk.Frame(self.root, bg="#0b1728", height=96, padx=18, pady=14)
         header_frame.pack(side=tk.TOP, fill=tk.X)
 
-        title_box = tk.Frame(header_frame, bg="#1E293B")
+        title_box = tk.Frame(header_frame, bg="#0b1728")
         title_box.pack(side=tk.LEFT, fill=tk.Y)
 
-        logo_icon = tk.Label(title_box, text="⚡", font=("Segoe UI Emoji", 22), bg="#1E293B", fg="#38BDF8")
+        logo_icon = tk.Label(title_box, text="AI", font=("Arial", 22, "bold"), bg="#0b1728", fg="#7dd3fc")
         logo_icon.pack(side=tk.LEFT, padx=(0, 10))
 
-        title_text_frame = tk.Frame(title_box, bg="#1E293B")
+        title_text_frame = tk.Frame(title_box, bg="#0b1728")
         title_text_frame.pack(side=tk.LEFT)
 
-        app_title = tk.Label(title_text_frame, text="FaceTrack AI", font=("Segoe UI", 15, "bold"), fg="#F8FAFC", bg="#1E293B")
+        app_title = tk.Label(title_text_frame, text="FaceTrack AI", font=("Arial", 18, "bold"), fg="#f5f9ff", bg="#0b1728")
         app_title.pack(anchor="w")
 
-        app_sub = tk.Label(title_text_frame, text="Real-Time Face Recognition Attendance System", font=("Segoe UI", 9), fg="#94A3B8", bg="#1E293B")
+        app_sub = tk.Label(title_text_frame, text="Real-Time Face Recognition Attendance System", font=("Arial", 9), fg="#9bb0c9", bg="#0b1728")
         app_sub.pack(anchor="w")
 
-        session_box = tk.Frame(header_frame, bg="#0F172A", padx=15, pady=5, highlightbackground="#334155", highlightthickness=1)
-        session_box.pack(side=tk.LEFT, padx=30)
+        session_box = tk.Frame(header_frame, bg="#122235", padx=16, pady=8, highlightbackground="#294868", highlightthickness=1)
+        session_box.pack(side=tk.LEFT, padx=26)
 
-        lbl_course = tk.Label(session_box, text="CLASS: CS-401 (Computer Vision)", font=("Segoe UI", 9, "bold"), fg="#38BDF8", bg="#0F172A")
+        lbl_course = tk.Label(session_box, text="CLASS: CS-401 (Computer Vision)", font=("Arial", 9, "bold"), fg="#7dd3fc", bg="#122235")
         lbl_course.pack(anchor="w")
-        lbl_room = tk.Label(session_box, text="ROOM: Tech Lab 3 | LECTURER: Dr. Sharma", font=("Segoe UI", 8), fg="#94A3B8", bg="#0F172A")
-        lbl_room.pack(anchor="w")
+        self.lbl_room = tk.Label(session_box, text="", font=("Arial", 8), fg="#b5c7db", bg="#122235")
+        self.lbl_room.pack(anchor="w")
+        self._refresh_session_details()
 
-        right_box = tk.Frame(header_frame, bg="#1E293B")
+        btn_edit_session = self._build_action_button(
+            session_box,
+            "Edit Session Details",
+            command=self._edit_session_details,
+            bg="#1b3050",
+            fg="#e5eefb",
+            active_bg="#233f66",
+            font=("Arial", 8, "bold"),
+            padx=8,
+            pady=3,
+            side=None,
+        )
+        btn_edit_session.pack(anchor="w", pady=(6, 0))
+
+        right_box = tk.Frame(header_frame, bg="#0b1728")
         right_box.pack(side=tk.RIGHT)
 
-        self.clock_label = tk.Label(right_box, text="00:00:00 AM", font=("Consolas", 14, "bold"), fg="#F8FAFC", bg="#1E293B")
+        self.clock_label = tk.Label(right_box, text="00:00:00 AM", font=("Consolas", 15, "bold"), fg="#f5f9ff", bg="#0b1728")
         self.clock_label.pack(anchor="e")
 
-        self.date_label = tk.Label(right_box, text="Saturday, Aug 29, 2026", font=("Segoe UI", 8), fg="#94A3B8", bg="#1E293B")
+        self.date_label = tk.Label(right_box, text="Saturday, Aug 29, 2026", font=("Arial", 8), fg="#9bb0c9", bg="#0b1728")
         self.date_label.pack(anchor="e")
 
+    def _refresh_session_details(self):
+        self.lbl_room.configure(text=f"ROOM: {self.room_name} | LECTURER: {self.lecturer_name}")
+
+    def _edit_session_details(self):
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Edit Session Details")
+        dialog.configure(bg="#1E293B")
+        dialog.resizable(False, False)
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        container = tk.Frame(dialog, bg="#1E293B", padx=18, pady=16)
+        container.pack(fill=tk.BOTH, expand=True)
+
+        tk.Label(container, text="Room Name", font=("Arial", 9, "bold"),
+                 fg="#CBD5E1", bg="#1E293B").pack(anchor="w")
+        room_entry = tk.Entry(container, bg="#0F172A", fg="#F8FAFC", insertbackground="#38BDF8",
+                              font=("Arial", 9), relief=tk.FLAT, highlightbackground="#334155", highlightthickness=1)
+        room_entry.pack(fill=tk.X, pady=(3, 10), ipady=3)
+        room_entry.insert(0, self.room_name)
+
+        tk.Label(container, text="Lecturer Name", font=("Arial", 9, "bold"),
+                 fg="#CBD5E1", bg="#1E293B").pack(anchor="w")
+        lecturer_entry = tk.Entry(container, bg="#0F172A", fg="#F8FAFC", insertbackground="#38BDF8",
+                                  font=("Arial", 9), relief=tk.FLAT, highlightbackground="#334155", highlightthickness=1)
+        lecturer_entry.pack(fill=tk.X, pady=(3, 14), ipady=3)
+        lecturer_entry.insert(0, self.lecturer_name)
+
+        def save_details():
+            room = room_entry.get().strip()
+            lecturer = lecturer_entry.get().strip()
+            if not room or not lecturer:
+                messagebox.showerror("Validation Error", "Room and lecturer name are required.", parent=dialog)
+                return
+            self.room_name = room
+            self.lecturer_name = lecturer
+            self._refresh_session_details()
+            dialog.destroy()
+
+        tk.Button(container, text="Save Details", command=save_details,
+                  font=("Arial", 9, "bold"), bg="#2563EB", fg="#FFFFFF",
+                  relief=tk.FLAT, padx=10, pady=5, cursor="hand2").pack(fill=tk.X)
+
     def _build_main_layout(self):
-        main_content = tk.Frame(self.root, bg="#0F172A", padx=15, pady=12)
+        main_content = tk.Frame(self.root, bg="#07111d", padx=15, pady=12)
         main_content.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
-        left_col = tk.Frame(main_content, bg="#0F172A")
+        left_col = tk.Frame(main_content, bg="#07111d")
         left_col.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 10))
 
-        right_col = tk.Frame(main_content, bg="#0F172A", width=520)
+        right_col = tk.Frame(main_content, bg="#07111d", width=520)
         right_col.pack(side=tk.RIGHT, fill=tk.BOTH, expand=False, padx=(10, 0))
         right_col.pack_propagate(False)
 
@@ -276,134 +485,164 @@ class AttendanceApp:
         self._build_stats_and_tabs(right_col)
 
     def _build_video_panel(self, parent):
-        card = tk.Frame(parent, bg="#1E293B", padx=12, pady=12, highlightbackground="#334155", highlightthickness=1)
-        card.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        shell = tk.Frame(parent, bg="#0b1623", padx=6, pady=6, highlightbackground="#17314f", highlightthickness=1)
+        shell.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
-        vid_head = tk.Frame(card, bg="#1E293B")
+        card = tk.Frame(shell, bg="#122235", padx=12, pady=12, highlightbackground="#294868", highlightthickness=1)
+        card.pack(fill=tk.BOTH, expand=True)
+
+        vid_head = tk.Frame(card, bg="#122235")
         vid_head.pack(fill=tk.X, pady=(0, 8))
 
-        self.live_badge = tk.Label(vid_head, text="● LIVE WEBCAM", font=("Segoe UI", 9, "bold"), fg="#22C55E", bg="#1E293B")
+        self.live_badge = tk.Label(vid_head, text="LIVE WEBCAM", font=("Arial", 9, "bold"), fg="#34d399", bg="#122235")
         self.live_badge.pack(side=tk.LEFT)
 
-        source_frame = tk.Frame(vid_head, bg="#1E293B")
+        source_frame = tk.Frame(vid_head, bg="#122235")
         source_frame.pack(side=tk.RIGHT)
 
-        tk.Label(source_frame, text="Source: ", font=("Segoe UI", 9), fg="#94A3B8", bg="#1E293B").pack(side=tk.LEFT)
+        tk.Label(source_frame, text="Source: ", font=("Arial", 9), fg="#9bb0c9", bg="#122235").pack(side=tk.LEFT)
         self.source_combo = ttk.Combobox(source_frame, values=[
             "Camera 0 (Default Webcam)",
             "Camera 1 (External / Secondary)",
             "AI Simulation Mode"
-        ], state="readonly", width=25, font=("Segoe UI", 8))
+        ], state="readonly", width=25, font=("Arial", 8), style="Modern.TCombobox")
         self.source_combo.set("Camera 0 (Default Webcam)")
         self.source_combo.pack(side=tk.LEFT, padx=(2, 6))
         self.source_combo.bind("<<ComboboxSelected>>", self._on_source_changed)
 
-        # Video Canvas
         self.canvas_width = 680
         self.canvas_height = 430
-        self.canvas = tk.Canvas(card, width=self.canvas_width, height=self.canvas_height, bg="#0B0F19", highlightthickness=0)
+        self.canvas = tk.Canvas(card, width=self.canvas_width, height=self.canvas_height, bg="#081521",
+                               highlightthickness=1, highlightbackground="#18324c", bd=0)
         self.canvas.pack(fill=tk.BOTH, expand=True)
 
-        # Samsung Galaxy Book / Windows Privacy Troubleshoot bar
-        self.troubleshoot_bar = tk.Frame(card, bg="#7F1D1D", padx=10, pady=8, highlightbackground="#EF4444", highlightthickness=1)
-        
-        lbl_box = tk.Frame(self.troubleshoot_bar, bg="#7F1D1D")
+        self.troubleshoot_bar = tk.Frame(card, bg="#4c1d1d", padx=10, pady=8, highlightbackground="#ef4444", highlightthickness=1)
+
+        lbl_box = tk.Frame(self.troubleshoot_bar, bg="#4c1d1d")
         lbl_box.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
-        tk.Label(lbl_box, text="🔒 Samsung Galaxy Book Privacy Lock Detected (Image is Black):",
-                 font=("Segoe UI", 9, "bold"), fg="#FEE2E2", bg="#7F1D1D").pack(anchor="w")
+        tk.Label(lbl_box, text="Samsung Galaxy Book Privacy Lock Detected (Image is Black):",
+                 font=("Arial", 9, "bold"), fg="#fee2e2", bg="#4c1d1d").pack(anchor="w")
         tk.Label(lbl_box, text="Press Fn + F11 on your keyboard OR turn off 'Block Camera and Mic' in Samsung Settings.",
-                 font=("Segoe UI", 8), fg="#FECACA", bg="#7F1D1D").pack(anchor="w")
+                 font=("Arial", 8), fg="#fecaca", bg="#4c1d1d").pack(anchor="w")
 
-        btn_box = tk.Frame(self.troubleshoot_bar, bg="#7F1D1D")
+        btn_box = tk.Frame(self.troubleshoot_bar, bg="#4c1d1d")
         btn_box.pack(side=tk.RIGHT)
 
-        btn_samsung = tk.Button(btn_box, text="⚙ Open Samsung Settings", command=self._open_samsung_settings,
-                                font=("Segoe UI", 8, "bold"), bg="#DC2626", fg="#FFFFFF", relief=tk.FLAT, padx=8, pady=4, cursor="hand2")
+        btn_samsung = tk.Button(btn_box, text="Open Samsung Settings", command=self._open_samsung_settings,
+                                font=("Arial", 8, "bold"), bg="#dc2626", fg="#FFFFFF", relief=tk.FLAT, padx=8, pady=4, cursor="hand2")
         btn_samsung.pack(side=tk.RIGHT, padx=(4, 0))
 
         btn_win = tk.Button(btn_box, text="Windows Privacy", command=self._open_windows_camera_settings,
-                            font=("Segoe UI", 8), bg="#991B1B", fg="#FFFFFF", relief=tk.FLAT, padx=6, pady=4, cursor="hand2")
+                            font=("Arial", 8), bg="#991b1b", fg="#FFFFFF", relief=tk.FLAT, padx=6, pady=4, cursor="hand2")
         btn_win.pack(side=tk.RIGHT)
 
-        # Notification / Recognition Toast Banner
-        self.banner_frame = tk.Frame(card, bg="#0F172A", padx=12, pady=8, highlightbackground="#38BDF8", highlightthickness=1)
+        self.banner_frame = tk.Frame(card, bg="#0d1e2d", padx=12, pady=8, highlightbackground="#4cc9f0", highlightthickness=1)
         self.banner_frame.pack(fill=tk.X, pady=(10, 0))
 
-        self.banner_icon = tk.Label(self.banner_frame, text="ℹ", font=("Segoe UI Emoji", 12, "bold"), fg="#38BDF8", bg="#0F172A")
+        self.banner_icon = tk.Label(self.banner_frame, text="i", font=("Arial", 12, "bold"), fg="#7dd3fc", bg="#0d1e2d")
         self.banner_icon.pack(side=tk.LEFT, padx=(0, 8))
 
-        self.banner_label = tk.Label(self.banner_frame, text=self.recent_banner_text, font=("Segoe UI", 9, "bold"), fg="#F8FAFC", bg="#0F172A")
+        self.banner_label = tk.Label(self.banner_frame, text=self.recent_banner_text, font=("Arial", 9, "bold"), fg="#f5f9ff", bg="#0d1e2d")
         self.banner_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
-        # Controls Toolbar under video
-        ctrl_frame = tk.Frame(parent, bg="#0F172A", pady=10)
+        ctrl_frame = tk.Frame(parent, bg="#07111d", pady=10)
         ctrl_frame.pack(side=tk.BOTTOM, fill=tk.X)
 
-        self.btn_camera = tk.Button(ctrl_frame, text="⏸ Pause Feed", command=self._toggle_pause,
-                                    font=("Segoe UI", 10, "bold"), bg="#334155", fg="#FFFFFF",
-                                    activebackground="#475569", activeforeground="#FFFFFF",
-                                    relief=tk.FLAT, padx=14, pady=6, cursor="hand2")
-        self.btn_camera.pack(side=tk.LEFT, padx=(0, 8))
+        self.btn_camera = self._build_action_button(
+            ctrl_frame,
+            "Pause Feed",
+            command=self._toggle_pause,
+            bg="#213d5a",
+            fg="#f5f9ff",
+            active_bg="#2e4f74",
+            font=("Arial", 10, "bold"),
+            padx=14,
+            pady=6,
+            side=tk.LEFT,
+        )
 
-        self.btn_trigger_recognize = tk.Button(ctrl_frame, text="⚡ Recognize Face Now", command=self._force_face_detection,
-                                               font=("Segoe UI", 10, "bold"), bg="#2563EB", fg="#FFFFFF",
-                                               activebackground="#1D4ED8", activeforeground="#FFFFFF",
-                                               relief=tk.FLAT, padx=14, pady=6, cursor="hand2")
-        self.btn_trigger_recognize.pack(side=tk.LEFT, padx=(0, 8))
+        self.btn_trigger_recognize = self._build_action_button(
+            ctrl_frame,
+            "Recognize Face Now",
+            command=self._force_face_detection,
+            bg="#3b82f6",
+            fg="#FFFFFF",
+            active_bg="#2563eb",
+            font=("Arial", 10, "bold"),
+            padx=14,
+            pady=6,
+            side=tk.LEFT,
+        )
 
-        self.btn_load_photo = tk.Button(ctrl_frame, text="📁 Load Face Photo", command=self._load_photo_dialog,
-                                        font=("Segoe UI", 9), bg="#1E293B", fg="#94A3B8",
-                                        relief=tk.FLAT, padx=10, pady=6, cursor="hand2")
-        self.btn_load_photo.pack(side=tk.LEFT, padx=(0, 8))
+        self.btn_load_photo = self._build_action_button(
+            ctrl_frame,
+            "Load Face Photo",
+            command=self._load_photo_dialog,
+            bg="#122235",
+            fg="#cfe2ff",
+            active_bg="#1a3559",
+            font=("Arial", 9),
+            padx=10,
+            pady=6,
+            side=tk.LEFT,
+        )
 
-        self.btn_reconnect_cam = tk.Button(ctrl_frame, text="🔄 Restart Camera", command=self._restart_current_camera,
-                                           font=("Segoe UI", 9), bg="#1E293B", fg="#94A3B8",
-                                           relief=tk.FLAT, padx=10, pady=6, cursor="hand2")
-        self.btn_reconnect_cam.pack(side=tk.LEFT, padx=(0, 8))
+        self.btn_reconnect_cam = self._build_action_button(
+            ctrl_frame,
+            "Restart Camera",
+            command=self._restart_current_camera,
+            bg="#122235",
+            fg="#cfe2ff",
+            active_bg="#1a3559",
+            font=("Arial", 9),
+            padx=10,
+            pady=6,
+            side=tk.LEFT,
+        )
 
-        thresh_box = tk.Frame(ctrl_frame, bg="#0F172A")
+        thresh_box = tk.Frame(ctrl_frame, bg="#07111d")
         thresh_box.pack(side=tk.RIGHT)
 
-        tk.Label(thresh_box, text="Min Conf: ", font=("Segoe UI", 9), fg="#94A3B8", bg="#0F172A").pack(side=tk.LEFT)
+        tk.Label(thresh_box, text="Min Match: ", font=("Arial", 9), fg="#9bb0c9", bg="#07111d").pack(side=tk.LEFT)
         self.thresh_slider = tk.Scale(thresh_box, from_=50, to=95, orient=tk.HORIZONTAL,
-                                      bg="#0F172A", fg="#38BDF8", highlightthickness=0,
-                                      troughcolor="#1E293B", activebackground="#2563EB",
-                                      font=("Segoe UI", 8), length=100, command=self._on_slider_change)
+                                      bg="#07111d", fg="#7dd3fc", highlightthickness=0,
+                                      troughcolor="#122235", activebackground="#3b82f6",
+                                      font=("Arial", 8), length=100, command=self._on_slider_change)
         self.thresh_slider.set(self.confidence_threshold)
         self.thresh_slider.pack(side=tk.LEFT)
 
     def _build_stats_and_tabs(self, parent):
-        stats_frame = tk.Frame(parent, bg="#0F172A")
+        stats_frame = tk.Frame(parent, bg="#07111d")
         stats_frame.pack(fill=tk.X, pady=(0, 10))
 
-        self.kpi_enrolled = self._create_kpi_card(stats_frame, "ENROLLED", str(len(self.students)), "#38BDF8", 0)
-        self.kpi_present = self._create_kpi_card(stats_frame, "PRESENT", "0", "#22C55E", 1)
-        self.kpi_absent = self._create_kpi_card(stats_frame, "ABSENT", str(len(self.students)), "#EF4444", 2)
-        self.kpi_rate = self._create_kpi_card(stats_frame, "RATE", "0%", "#F59E0B", 3)
+        self.kpi_enrolled = self._create_kpi_card(stats_frame, "ENROLLED", str(len(self.students)), "#7dd3fc", 0)
+        self.kpi_present = self._create_kpi_card(stats_frame, "PRESENT", "0", "#34d399", 1)
+        self.kpi_absent = self._create_kpi_card(stats_frame, "ABSENT", str(len(self.students)), "#f87171", 2)
+        self.kpi_rate = self._create_kpi_card(stats_frame, "RATE", "0%", "#fbbf24", 3)
 
         self.notebook = ttk.Notebook(parent)
         self.notebook.pack(fill=tk.BOTH, expand=True)
 
-        self.tab_log = tk.Frame(self.notebook, bg="#1E293B", padx=10, pady=10)
-        self.tab_students = tk.Frame(self.notebook, bg="#1E293B", padx=10, pady=10)
-        self.tab_enroll = tk.Frame(self.notebook, bg="#1E293B", padx=10, pady=10)
+        self.tab_log = tk.Frame(self.notebook, bg="#122235", padx=10, pady=10, highlightbackground="#294868", highlightthickness=1)
+        self.tab_students = tk.Frame(self.notebook, bg="#122235", padx=10, pady=10, highlightbackground="#294868", highlightthickness=1)
+        self.tab_enroll = tk.Frame(self.notebook, bg="#122235", padx=10, pady=10, highlightbackground="#294868", highlightthickness=1)
 
-        self.notebook.add(self.tab_log, text="📋 Live Session Log")
-        self.notebook.add(self.tab_students, text="👥 Student Roster")
-        self.notebook.add(self.tab_enroll, text="➕ Enroll New")
+        self.notebook.add(self.tab_log, text="Live Session Log")
+        self.notebook.add(self.tab_students, text="Student Roster")
+        self.notebook.add(self.tab_enroll, text="Enroll New")
 
         self._build_attendance_log_tab()
         self._build_student_roster_tab()
         self._build_enroll_tab()
 
     def _create_kpi_card(self, parent, title, value, accent_color, col_idx):
-        card = tk.Frame(parent, bg="#1E293B", padx=10, pady=8, highlightbackground="#334155", highlightthickness=1)
-        card.grid(row=0, column=col_idx, padx=3, sticky="nsew")
+        card = tk.Frame(parent, bg="#122235", padx=10, pady=10, highlightbackground="#2d4d6d", highlightthickness=1)
+        card.grid(row=0, column=col_idx, padx=4, pady=0, sticky="nsew")
         parent.grid_columnconfigure(col_idx, weight=1)
 
-        tk.Label(card, text=title, font=("Segoe UI", 7, "bold"), fg="#94A3B8", bg="#1E293B").pack(anchor="w")
-        val_lbl = tk.Label(card, text=value, font=("Segoe UI", 15, "bold"), fg=accent_color, bg="#1E293B")
+        tk.Label(card, text=title, font=("Arial", 7, "bold"), fg="#9bb0c9", bg="#122235").pack(anchor="w")
+        val_lbl = tk.Label(card, text=value, font=("Arial", 16, "bold"), fg=accent_color, bg="#122235")
         val_lbl.pack(anchor="w")
         return val_lbl
 
@@ -411,19 +650,19 @@ class AttendanceApp:
         tb = tk.Frame(self.tab_log, bg="#1E293B")
         tb.pack(fill=tk.X, pady=(0, 8))
 
-        tk.Label(tb, text="🔍", font=("Segoe UI Emoji", 10), fg="#94A3B8", bg="#1E293B").pack(side=tk.LEFT, padx=(0, 4))
+        tk.Label(tb, text="Search", font=("Arial", 10), fg="#94A3B8", bg="#1E293B").pack(side=tk.LEFT, padx=(0, 4))
         self.search_entry = tk.Entry(tb, bg="#0F172A", fg="#F8FAFC", insertbackground="#38BDF8",
-                                     font=("Segoe UI", 9), relief=tk.FLAT, highlightbackground="#334155", highlightthickness=1)
+                                     font=("Arial", 9), relief=tk.FLAT, highlightbackground="#334155", highlightthickness=1)
         self.search_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8), ipady=3)
         self.search_entry.bind("<KeyRelease>", self._filter_attendance_log)
 
-        btn_export = tk.Button(tb, text="📥 Export CSV", command=self._export_attendance_csv,
-                               font=("Segoe UI", 8, "bold"), bg="#059669", fg="#FFFFFF",
+        btn_export = tk.Button(tb, text="Export CSV", command=self._export_attendance_csv,
+                               font=("Arial", 8, "bold"), bg="#059669", fg="#FFFFFF",
                                relief=tk.FLAT, padx=8, pady=3, cursor="hand2")
         btn_export.pack(side=tk.RIGHT, padx=(4, 0))
 
-        btn_clear = tk.Button(tb, text="🗑 Clear", command=self._clear_attendance_log,
-                              font=("Segoe UI", 8), bg="#334155", fg="#94A3B8",
+        btn_clear = tk.Button(tb, text="Clear", command=self._clear_attendance_log,
+                              font=("Arial", 8), bg="#334155", fg="#94A3B8",
                               relief=tk.FLAT, padx=6, pady=3, cursor="hand2")
         btn_clear.pack(side=tk.RIGHT)
 
@@ -459,9 +698,12 @@ class AttendanceApp:
         roster_head = tk.Frame(self.tab_students, bg="#1E293B")
         roster_head.pack(fill=tk.X, pady=(0, 6))
 
-        tk.Label(roster_head, text="All Enrolled Candidates in Session", font=("Segoe UI", 9, "bold"), fg="#38BDF8", bg="#1E293B").pack(side=tk.LEFT)
-        btn_mark_sel = tk.Button(roster_head, text="✔ Mark Selected Present", command=self._manual_mark_selected,
-                                 font=("Segoe UI", 8, "bold"), bg="#2563EB", fg="#FFFFFF", relief=tk.FLAT, padx=6, pady=2, cursor="hand2")
+        tk.Label(roster_head, text="All Enrolled Candidates in Session", font=("Arial", 9, "bold"), fg="#38BDF8", bg="#1E293B").pack(side=tk.LEFT)
+        btn_delete_sel = tk.Button(roster_head, text="Delete Selected", command=self._delete_selected_student,
+                       font=("Arial", 8, "bold"), bg="#991B1B", fg="#FFFFFF", relief=tk.FLAT, padx=6, pady=2, cursor="hand2")
+        btn_delete_sel.pack(side=tk.RIGHT, padx=(6, 0))
+        btn_mark_sel = tk.Button(roster_head, text="Mark Selected Present", command=self._manual_mark_selected,
+                                 font=("Arial", 8, "bold"), bg="#2563EB", fg="#FFFFFF", relief=tk.FLAT, padx=6, pady=2, cursor="hand2")
         btn_mark_sel.pack(side=tk.RIGHT)
 
         tree_frame = tk.Frame(self.tab_students, bg="#1E293B")
@@ -495,7 +737,7 @@ class AttendanceApp:
         container = tk.Frame(self.tab_enroll, bg="#1E293B", padx=10, pady=10)
         container.pack(fill=tk.BOTH, expand=True)
 
-        tk.Label(container, text="Enroll New Student to Face Recognition Engine", font=("Segoe UI", 10, "bold"), fg="#38BDF8", bg="#1E293B").pack(anchor="w", pady=(0, 10))
+        tk.Label(container, text="Enroll New Student to Face Recognition Engine", font=("Arial", 10, "bold"), fg="#38BDF8", bg="#1E293B").pack(anchor="w", pady=(0, 10))
 
         fields = [
             ("Student ID (e.g. STU-1009):", "entry_id"),
@@ -506,33 +748,40 @@ class AttendanceApp:
 
         self.enroll_entries = {}
         for label_text, var_name in fields:
-            lbl = tk.Label(container, text=label_text, font=("Segoe UI", 9), fg="#CBD5E1", bg="#1E293B")
+            lbl = tk.Label(container, text=label_text, font=("Arial", 9), fg="#CBD5E1", bg="#1E293B")
             lbl.pack(anchor="w", pady=(4, 1))
 
             ent = tk.Entry(container, bg="#0F172A", fg="#F8FAFC", insertbackground="#38BDF8",
-                           font=("Segoe UI", 9), relief=tk.FLAT, highlightbackground="#334155", highlightthickness=1)
+                           font=("Arial", 9), relief=tk.FLAT, highlightbackground="#334155", highlightthickness=1)
             ent.pack(fill=tk.X, pady=(0, 6), ipady=3)
             self.enroll_entries[var_name] = ent
 
         next_id = f"STU-{1001 + len(self.students)}"
         self.enroll_entries["entry_id"].insert(0, next_id)
-        self.enroll_entries["entry_batch"].insert(0, "2024-2028")
+        self.enroll_entries["entry_batch"].insert(0, "2026-2030")
 
-        btn_save = tk.Button(container, text="📸 Capture Face & Enroll Student", command=self._enroll_student_action,
-                             font=("Segoe UI", 10, "bold"), bg="#059669", fg="#FFFFFF",
+        self.btn_enroll_save = tk.Button(container, text="Capture Face & Enroll Student", command=self._enroll_student_action,
+                             font=("Arial", 10, "bold"), bg="#059669", fg="#FFFFFF",
                              relief=tk.FLAT, padx=12, pady=8, cursor="hand2")
-        btn_save.pack(fill=tk.X, pady=(15, 0))
+        self.btn_enroll_save.pack(fill=tk.X, pady=(15, 0))
+
+        self.enroll_hint_label = tk.Label(
+            container,
+            text="Tip: face the camera clearly before enrolling. 8 face samples are captured automatically over ~2.5s.",
+            font=("Arial", 8), fg="#64748B", bg="#1E293B", wraplength=340, justify=tk.LEFT
+        )
+        self.enroll_hint_label.pack(anchor="w", pady=(8, 0))
 
     def _build_statusbar(self):
-        statusbar = tk.Frame(self.root, bg="#0B0F19", height=26, padx=15)
+        statusbar = tk.Frame(self.root, bg="#081521", height=28, padx=15)
         statusbar.pack(side=tk.BOTTOM, fill=tk.X)
 
         self.status_left = tk.Label(statusbar, text="Device: Samsung 750XGK (720p HD Camera) | DirectShow Stream Active",
-                                    font=("Segoe UI", 8), fg="#64748B", bg="#0B0F19")
+                                    font=("Arial", 8), fg="#8aa4bb", bg="#081521")
         self.status_left.pack(side=tk.LEFT)
 
         self.status_right = tk.Label(statusbar, text="Status: Online & Monitoring",
-                                     font=("Segoe UI", 8, "bold"), fg="#22C55E", bg="#0B0F19")
+                                     font=("Arial", 8, "bold"), fg="#34d399", bg="#081521")
         self.status_right.pack(side=tk.RIGHT)
 
     # =========================================================================
@@ -564,8 +813,24 @@ class AttendanceApp:
             img = Image.open(filename).convert("RGB")
             self.uploaded_image = img
             self.source_combo.set("Custom Image / Photo")
-            self.live_badge.configure(text="● PHOTO MODE", fg="#38BDF8")
-            self._set_banner(f"Loaded image '{os.path.basename(filename)}'. Ready for recognition!", "success")
+            self.live_badge.configure(text="PHOTO MODE", fg="#38BDF8")
+
+            self.last_face_rect = None
+            self.last_face_gray = None
+
+            if self.face_engine is not None:
+                cv_img = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+                rect, face_gray = self.face_engine.largest_face(cv_img)
+                if rect is not None:
+                    self.last_face_rect = rect
+                    self.last_face_gray = face_gray
+                    self.last_face_source_size = (cv_img.shape[1], cv_img.shape[0])
+                    self.last_face_seen_time = time.time()
+                    self._set_banner(f"Loaded '{os.path.basename(filename)}' - face detected, ready for recognition!", "success")
+                else:
+                    self._set_banner(f"Loaded '{os.path.basename(filename)}', but no face was detected in it.", "warning")
+            else:
+                self._set_banner(f"Loaded image '{os.path.basename(filename)}'. (Face engine unavailable.)", "warning")
         except Exception as e:
             messagebox.showerror("Error", f"Failed to load image: {str(e)}")
 
@@ -576,14 +841,14 @@ class AttendanceApp:
             self.camera_thread = None
 
         if index == "sim" or not OPENCV_AVAILABLE:
-            self.live_badge.configure(text="● AI SIMULATION", fg="#38BDF8")
+            self.live_badge.configure(text="AI SIMULATION", fg="#38BDF8")
             self.troubleshoot_bar.pack_forget()
             self._set_banner("Running in AI Simulation mode.", "info")
             return
 
         self.camera_thread = WebcamCaptureThread(camera_index=int(index))
         self.camera_thread.start()
-        self.live_badge.configure(text=f"● LIVE CAM {index}", fg="#22C55E")
+        self.live_badge.configure(text=f"LIVE CAM {index}", fg="#22C55E")
         self._set_banner(f"Connecting to Camera {index}...", "info")
 
     def _on_source_changed(self, event=None):
@@ -602,29 +867,50 @@ class AttendanceApp:
     def _toggle_pause(self):
         self.is_feed_paused = not self.is_feed_paused
         if self.is_feed_paused:
-            self.btn_camera.configure(text="▶ Resume Feed", bg="#059669")
-            self.live_badge.configure(text="⏸ PAUSED", fg="#F59E0B")
+            self.btn_camera.configure(text="Resume Feed", bg="#059669")
+            self.live_badge.configure(text="PAUSED", fg="#F59E0B")
             self._set_banner("Camera feed paused.", "warning")
         else:
-            self.btn_camera.configure(text="⏸ Pause Feed", bg="#334155")
-            self.live_badge.configure(text="● LIVE FEED", fg="#22C55E")
+            self.btn_camera.configure(text="Pause Feed", bg="#334155")
+            self.live_badge.configure(text="LIVE FEED", fg="#22C55E")
             self._set_banner("Camera feed resumed.", "info")
 
     def _on_slider_change(self, val):
         self.confidence_threshold = int(val)
+        save_confidence_threshold(self.confidence_threshold)
 
     # =========================================================================
     # RECOGNITION & ATTENDANCE LOGIC
     # =========================================================================
     def _force_face_detection(self):
-        unmarked = [s for s in self.students if s["status"] == "Not Marked"]
-        if not unmarked:
-            self._set_banner("All enrolled students have already marked attendance!", "warning")
+        if self.face_engine is None:
+            self._set_banner("Face engine unavailable - check the console for the load error.", "warning")
             return
 
-        student = random.choice(unmarked)
-        conf = random.randint(max(self.confidence_threshold, 84), 99)
-        self._record_attendance(student, conf)
+        if not self.recognition_enabled:
+            self._set_banner("Recognition disabled: install opencv-contrib-python (pip install opencv-contrib-python).", "warning")
+            return
+
+        if self.last_face_gray is None or (time.time() - self.last_face_seen_time) > 1.5:
+            self._set_banner("No face currently detected in frame. Face the camera and try again.", "warning")
+            return
+
+        student_id, confidence = self.face_engine.predict(self.last_face_gray)
+
+        if student_id is None:
+            self._set_banner("No enrolled faces to match against yet. Enroll a student first.", "warning")
+            return
+
+        if confidence < self.confidence_threshold:
+            self._set_banner(f"Face detected but not confidently recognized (best match: {confidence:.0f}%, threshold: {self.confidence_threshold}%).", "warning")
+            return
+
+        student = next((s for s in self.students if s["id"] == student_id), None)
+        if not student:
+            self._set_banner("Recognized a face but no matching roster entry was found.", "warning")
+            return
+
+        self._record_attendance(student, round(confidence))
 
     def _record_attendance(self, student, confidence):
         curr_time = datetime.datetime.now().strftime("%I:%M:%S %p")
@@ -656,7 +942,7 @@ class AttendanceApp:
         self._refresh_log_tree()
         self._refresh_roster_tree()
         self._update_kpis()
-        self._set_banner(f"✅ Attendance Marked: {student['name']} [{student['id']}] - Conf: {confidence}%", "success")
+        self._set_banner(f"Attendance Marked: {student['name']} [{student['id']}] - Conf: {confidence}%", "success")
 
     def _manual_mark_selected(self):
         sel = self.roster_tree.selection()
@@ -674,6 +960,42 @@ class AttendanceApp:
                 return
             self._record_attendance(student, confidence=100)
 
+    def _delete_selected_student(self):
+        sel = self.roster_tree.selection()
+        if not sel:
+            messagebox.showwarning("Select Student", "Please select a student from the roster first.")
+            return
+
+        item = self.roster_tree.item(sel[0])
+        stu_id = item["values"][0]
+        student = next((s for s in self.students if s["id"] == stu_id), None)
+        if student is None:
+            return
+
+        confirmed = messagebox.askyesno(
+            "Delete Student",
+            f"Delete {student['name']} ({student['id']}) and all saved face samples?"
+        )
+        if not confirmed:
+            return
+
+        if self.face_engine is not None and not self.face_engine.delete_student(stu_id):
+            messagebox.showerror("Delete Failed", f"Could not delete saved face samples for {student['name']}.")
+            return
+
+        self.students.remove(student)
+        self.attendance_log = [record for record in self.attendance_log if record["id"] != stu_id]
+        if self.detected_face_info and self.detected_face_info["student"]["id"] == stu_id:
+            self.detected_face_info = None
+
+        if self.face_engine is not None:
+            self.face_engine.train()
+        save_students_db(self.students)
+        self._refresh_log_tree()
+        self._refresh_roster_tree()
+        self._update_kpis()
+        self._set_banner(f"Deleted student {student['name']} ({student['id']}).", "info")
+
     def _enroll_student_action(self):
         stu_id = self.enroll_entries["entry_id"].get().strip()
         name = self.enroll_entries["entry_name"].get().strip()
@@ -684,15 +1006,38 @@ class AttendanceApp:
             messagebox.showerror("Validation Error", "Student ID and Full Name are required.")
             return
 
+        if not re.fullmatch(r"[A-Za-z0-9_-]{2,32}", stu_id):
+            messagebox.showerror(
+                "Invalid Student ID",
+                "Student ID must be 2-32 characters and contain only letters, numbers, '-' or '_'."
+            )
+            return
+
         if any(s["id"].lower() == stu_id.lower() for s in self.students):
             messagebox.showerror("Duplicate ID", f"A student with ID {stu_id} already exists.")
+            return
+
+        if self.face_engine is None:
+            messagebox.showerror("Face Engine Unavailable", "The face engine failed to load, so students can't be enrolled with face data.")
+            return
+
+        if not self.recognition_enabled:
+            messagebox.showerror(
+                "Recognition Disabled",
+                "Recognition requires opencv-contrib-python (pip install opencv-contrib-python).\n"
+                "Detection works without it, but faces can't be enrolled/matched yet."
+            )
+            return
+
+        if self.last_face_gray is None or (time.time() - self.last_face_seen_time) > 1.5:
+            messagebox.showerror("No Face Detected", "Position the person's face clearly in the camera preview (or load a clear photo of them) before enrolling.")
             return
 
         new_student = {
             "id": stu_id,
             "name": name,
             "dept": dept or "Computer Science",
-            "batch": batch or "2024-2028",
+            "batch": batch or "2026-2030",
             "status": "Not Marked",
             "time": "-",
             "conf": "-"
@@ -701,14 +1046,33 @@ class AttendanceApp:
         self._refresh_roster_tree()
         self._update_kpis()
 
-        self.enroll_entries["entry_name"].delete(0, tk.END)
-        next_id = f"STU-{1001 + len(self.students)}"
-        self.enroll_entries["entry_id"].delete(0, tk.END)
-        self.enroll_entries["entry_id"].insert(0, next_id)
+        self.btn_enroll_save.configure(state=tk.DISABLED)
+        self._enroll_capture_step(stu_id, name, sample_index=0, total_samples=8)
 
-        self._set_banner(f"🎓 Enrolled student: {name} ({stu_id}) successfully!", "success")
-        messagebox.showinfo("Success", f"Student '{name}' has been successfully enrolled into the Face Recognition database!")
-        self.notebook.select(self.tab_students)
+    def _enroll_capture_step(self, stu_id, name, sample_index, total_samples):
+        """Grabs a fresh face sample from the current live detection every ~300ms
+        so consecutive samples capture slightly different angles/expressions."""
+        if self.last_face_gray is not None and (time.time() - self.last_face_seen_time) < 1.5:
+            self.face_engine.save_sample(stu_id, self.last_face_gray, sample_index)
+            sample_index += 1
+            self._set_banner(f"Capturing face samples for {name}... ({sample_index}/{total_samples})", "info")
+
+        if sample_index < total_samples:
+            self.root.after(300, lambda: self._enroll_capture_step(stu_id, name, sample_index, total_samples))
+        else:
+            ok, msg = self.face_engine.train()
+            save_students_db(self.students)  # persist roster so a restart doesn't lose enrolled students
+            if ok:
+                self._set_banner(f"Enrolled {name} ({stu_id}) - {msg}", "success")
+            else:
+                self._set_banner(f"Enrolled {name} ({stu_id}), but training failed: {msg}", "warning")
+
+            self.btn_enroll_save.configure(state=tk.NORMAL)
+            self.enroll_entries["entry_name"].delete(0, tk.END)
+            next_id = f"STU-{1001 + len(self.students)}"
+            self.enroll_entries["entry_id"].delete(0, tk.END)
+            self.enroll_entries["entry_id"].insert(0, next_id)
+            self.notebook.select(self.tab_students)
 
     def _export_attendance_csv(self):
         if not self.attendance_log:
@@ -740,6 +1104,7 @@ class AttendanceApp:
             return
         if messagebox.askyesno("Confirm Clear", "Are you sure you want to clear the session attendance log?"):
             self.attendance_log.clear()
+            self.detected_face_info = None
             for s in self.students:
                 s["status"] = "Not Marked"
                 s["time"] = "-"
@@ -754,11 +1119,11 @@ class AttendanceApp:
         self.recent_banner_type = banner_type
 
         colors = {
-            "info": ("#38BDF8", "ℹ"),
-            "success": ("#22C55E", "✅"),
-            "warning": ("#F59E0B", "⚠️")
+            "info": ("#38BDF8", "i"),
+            "success": ("#22C55E", "OK"),
+            "warning": ("#F59E0B", "!")
         }
-        accent, icon = colors.get(banner_type, ("#38BDF8", "ℹ"))
+        accent, icon = colors.get(banner_type, ("#38BDF8", "i"))
 
         self.banner_frame.configure(highlightbackground=accent)
         self.banner_icon.configure(text=icon, fg=accent)
@@ -828,6 +1193,10 @@ class AttendanceApp:
                 pil_image = self.uploaded_image.copy().resize((w, h), Image.Resampling.BILINEAR)
                 is_hardware_cam = True
                 is_black = False
+                if self.last_face_rect is not None:
+                    # Static photo: keep its one-time detection "fresh" so it doesn't
+                    # expire from the HUD/recognition just because time passed.
+                    self.last_face_seen_time = time.time()
                 if self.black_frame_warning_shown:
                     self.troubleshoot_bar.pack_forget()
                     self.black_frame_warning_shown = False
@@ -845,12 +1214,15 @@ class AttendanceApp:
 
                 if raw_cv_frame is not None and not is_black:
                     raw_cv_frame = cv2.flip(raw_cv_frame, 1)
+                    if self.face_engine is not None and self.anim_tick % 2 == 0:
+                        self._update_face_detection(raw_cv_frame)
                     rgb = cv2.cvtColor(raw_cv_frame, cv2.COLOR_BGR2RGB)
                     pil_image = Image.fromarray(rgb).resize((w, h), Image.Resampling.BILINEAR)
                     is_hardware_cam = True
                 else:
                     pil_image = self._generate_synthetic_feed(w, h, is_black)
                     is_hardware_cam = False
+                    self.last_face_rect = None  # no real frame -> nothing real was detected
 
             pil_image = self._apply_hud_overlay(pil_image, w, h, is_hardware_cam, is_black)
 
@@ -859,6 +1231,23 @@ class AttendanceApp:
             self.canvas.create_image(0, 0, image=self.tk_image, anchor="nw")
 
         self.root.after(25, self._video_loop)
+
+    def _update_face_detection(self, bgr_frame):
+        """Runs real Haar-cascade detection on the current camera frame and
+        updates the last-known face box/crop used for the HUD and recognition."""
+        try:
+            rect, face_gray = self.face_engine.largest_face(bgr_frame, downscale=0.5)
+        except Exception:
+            rect, face_gray = None, None
+
+        if rect is not None:
+            self.last_face_rect = rect
+            self.last_face_gray = face_gray
+            self.last_face_source_size = (bgr_frame.shape[1], bgr_frame.shape[0])
+            self.last_face_seen_time = time.time()
+        # If no face this tick, we deliberately leave the old rect in place.
+        # _apply_hud_overlay expires it based on last_face_seen_time, so a brief
+        # miss doesn't cause flicker, but a real absence still expires within ~1.2s.
 
     def _generate_synthetic_feed(self, width, height, is_black=False):
         img = Image.new("RGB", (width, height), color=(11, 15, 25))
@@ -871,7 +1260,7 @@ class AttendanceApp:
             draw.line([(0, y), (width, y)], fill=(18, 26, 43), width=1)
 
         if is_black:
-            draw.text((width // 2 - 145, height // 2 - 60), "🔒 SAMSUNG PRIVACY LOCK ACTIVE (BLACK FEED)", fill=(239, 68, 68))
+            draw.text((width // 2 - 145, height // 2 - 60), "SAMSUNG PRIVACY LOCK ACTIVE (BLACK FEED)", fill=(239, 68, 68))
             draw.text((width // 2 - 165, height // 2 - 38), "1. Press [ Fn + F11 ] on your Samsung keyboard", fill=(248, 113, 113))
             draw.text((width // 2 - 165, height // 2 - 18), "2. In Samsung Settings > Privacy > Turn OFF 'Block Camera'", fill=(248, 113, 113))
             draw.text((width // 2 - 165, height // 2 + 2), "3. Or click 'Load Face Photo' to test with an image file", fill=(248, 113, 113))
@@ -883,50 +1272,55 @@ class AttendanceApp:
     def _apply_hud_overlay(self, img, width, height, is_hardware_cam, is_black):
         draw = ImageDraw.Draw(img)
 
-        cx, cy = width // 2, height // 2 - 15
-        box_w, box_h = 240, 270
-        x1, y1 = cx - box_w // 2, cy - box_h // 2
-        x2, y2 = cx + box_w // 2, cy + box_h // 2
+        now = time.time()
+        is_recognized = self.detected_face_info and now < self.detected_face_info["expire"]
 
-        is_detected = self.detected_face_info and time.time() < self.detected_face_info["expire"]
-        hud_color = (34, 197, 94) if is_detected else (56, 189, 248)
+        # Resolve the REAL detected face box (from Haar cascade), scaled from
+        # the source frame's pixel space into this canvas's pixel space.
+        face_box = None
+        if self.last_face_rect is not None and (now - self.last_face_seen_time) < 1.2:
+            src_w, src_h = self.last_face_source_size
+            if src_w and src_h:
+                sx, sy = width / src_w, height / src_h
+                fx, fy, fw, fh = self.last_face_rect
+                bx1, by1 = int(fx * sx), int(fy * sy)
+                bx2, by2 = int((fx + fw) * sx), int((fy + fh) * sy)
+                face_box = (bx1, by1, bx2, by2)
 
-        if not is_detected:
-            scan_y = y1 + int((math.sin(self.anim_tick * 0.08) * 0.5 + 0.5) * box_h)
-            draw.line([(x1 + 8, scan_y), (x2 - 8, scan_y)], fill=(56, 189, 248), width=2)
-            draw.line([(x1 + 25, scan_y + 1), (x2 - 25, scan_y + 1)], fill=(14, 116, 144), width=1)
+        if face_box:
+            x1, y1, x2, y2 = face_box
+            hud_color = (34, 197, 94) if is_recognized else (56, 189, 248)
 
-        c_len = 28
-        th = 3
-        draw.line([(x1, y1), (x1 + c_len, y1)], fill=hud_color, width=th)
-        draw.line([(x1, y1), (x1, y1 + c_len)], fill=hud_color, width=th)
-        draw.line([(x2, y1), (x2 - c_len, y1)], fill=hud_color, width=th)
-        draw.line([(x2, y1), (x2, y1 + c_len)], fill=hud_color, width=th)
-        draw.line([(x1, y2), (x1 + c_len, y2)], fill=hud_color, width=th)
-        draw.line([(x1, y2), (x1 + c_len, y2)], fill=hud_color, width=th)
-        draw.line([(x2, y2), (x2 - c_len, y2)], fill=hud_color, width=th)
-        draw.line([(x2, y2), (x2 - c_len, y2)], fill=hud_color, width=th)
+            c_len = max(14, int(min(x2 - x1, y2 - y1) * 0.18))
+            th = 3
+            draw.line([(x1, y1), (x1 + c_len, y1)], fill=hud_color, width=th)
+            draw.line([(x1, y1), (x1, y1 + c_len)], fill=hud_color, width=th)
+            draw.line([(x2, y1), (x2 - c_len, y1)], fill=hud_color, width=th)
+            draw.line([(x2, y1), (x2, y1 + c_len)], fill=hud_color, width=th)
+            draw.line([(x1, y2), (x1 + c_len, y2)], fill=hud_color, width=th)
+            draw.line([(x1, y2), (x1, y2 - c_len)], fill=hud_color, width=th)
+            draw.line([(x2, y2), (x2 - c_len, y2)], fill=hud_color, width=th)
+            draw.line([(x2, y2), (x2, y2 - c_len)], fill=hud_color, width=th)
 
-        landmarks = [
-            (cx - 35, cy - 30), (cx + 35, cy - 30),
-            (cx, cy),
-            (cx - 25, cy + 30), (cx + 25, cy + 30)
-        ]
-        for lx, ly in landmarks:
-            draw.ellipse([lx - 2, ly - 2, lx + 2, ly + 2], fill=hud_color)
+            tag_text = "FACE RECOGNIZED & VERIFIED" if is_recognized else "FACE DETECTED"
+            draw.rectangle([(x1, y1 - 22), (x1 + 200, y1 - 2)], fill=(15, 23, 42))
+            draw.text((x1 + 6, y1 - 19), tag_text, fill=hud_color)
 
-        tag_text = "FACE DETECTED & VERIFIED" if is_detected else "SCANNING FOR ENROLLED FACES..."
-        draw.rectangle([(x1, y1 - 26), (x1 + 230, y1 - 4)], fill=(15, 23, 42))
-        draw.text((x1 + 8, y1 - 22), tag_text, fill=hud_color)
-
-        if is_detected:
-            student = self.detected_face_info["student"]
-            conf = self.detected_face_info["conf"]
-            card_h = 62
-            draw.rectangle([(x1, y2 + 6), (x2, y2 + 6 + card_h)], fill=(15, 23, 42), outline=(34, 197, 94), width=1)
-            draw.text((x1 + 10, y2 + 12), f"{student['name']} ({student['id']})", fill=(248, 250, 252))
-            draw.text((x1 + 10, y2 + 30), f"Dept: {student['dept']}", fill=(148, 163, 184))
-            draw.text((x1 + 10, y2 + 46), f"Match Confidence: {conf}% (VERIFIED)", fill=(74, 222, 128))
+            if is_recognized:
+                student = self.detected_face_info["student"]
+                conf = self.detected_face_info["conf"]
+                card_h = 62
+                draw.rectangle([(x1, y2 + 6), (x1 + 230, y2 + 6 + card_h)], fill=(15, 23, 42), outline=(34, 197, 94), width=1)
+                draw.text((x1 + 10, y2 + 12), f"{student['name']} ({student['id']})", fill=(248, 250, 252))
+                draw.text((x1 + 10, y2 + 30), f"Dept: {student['dept']}", fill=(148, 163, 184))
+                draw.text((x1 + 10, y2 + 46), f"Match Confidence: {conf}% (VERIFIED)", fill=(74, 222, 128))
+        else:
+            # No real face currently detected - an honest "searching" indicator,
+            # not a fake bounding box sitting over nothing.
+            scan_y = int(height * 0.5 + math.sin(self.anim_tick * 0.08) * height * 0.15)
+            draw.line([(40, scan_y), (width - 40, scan_y)], fill=(56, 189, 248), width=1)
+            draw.rectangle([(width // 2 - 95, height - 34), (width // 2 + 95, height - 12)], fill=(15, 23, 42))
+            draw.text((width // 2 - 85, height - 30), "SEARCHING FOR FACE...", fill=(56, 189, 248))
 
         if is_black:
             cam_status_text = "SAMSUNG PRIVACY LOCK [BLACK]"
@@ -939,8 +1333,15 @@ class AttendanceApp:
 
         draw.text((15, 15), f"STREAM: {cam_status_text}", fill=(148, 163, 184))
         draw.text((15, 32), f"FPS: {self.current_fps:.1f} | RES: {width}x{height}", fill=(100, 116, 139))
-        draw.text((width - 165, 15), "AI ENGINE: ONLINE", fill=(34, 197, 94))
-        draw.text((width - 165, 32), f"THRESHOLD: {self.confidence_threshold}%", fill=(56, 189, 248))
+
+        if self.recognition_enabled:
+            engine_text, engine_color = "AI ENGINE: ONLINE", (34, 197, 94)
+        elif self.face_engine is not None:
+            engine_text, engine_color = "AI ENGINE: DETECT-ONLY", (245, 158, 11)
+        else:
+            engine_text, engine_color = "AI ENGINE: OFFLINE", (239, 68, 68)
+        draw.text((width - 190, 15), engine_text, fill=engine_color)
+        draw.text((width - 190, 32), f"THRESHOLD: {self.confidence_threshold}%", fill=(56, 189, 248))
 
         return img
 
